@@ -34,13 +34,22 @@ Installed        /usr/local/bin/vram-mode
 ```bash
 git clone git@github.com:soimy/vram-mode.git ~/Repo/vram-mode
 cd ~/Repo/vram-mode
-./install.sh                          # 装到 /usr/local/bin（sudo 一次）
-PREFIX=$HOME/.local ./install.sh      # 或只装到用户目录，不装桌面图标
+./install.sh                          # 首次安装：/usr/local/bin（脚本自己 sudo）
+PREFIX=$HOME/.local ./install.sh      # 或只装到 ~/.local/bin，不装桌面图标
 ```
 
-`install.sh` 同时装 `vram-mode` 和 `free-vram`，并在
-`~/.local/share/applications` 放两个菜单入口（有 `~/Desktop` 时才放桌面图标）。
-也可以只装主程序：`sudo vram-mode install`。
+`./install.sh` 是**唯一的首次安装入口**：它同时装 `vram-mode` 和 `free-vram`，
+并在 `~/.local/share/applications` 放两个菜单入口（有 `~/Desktop` 时才放桌面图标）。
+
+装好之后，`sudo vram-mode install` 用于原地更新和补装菜单入口 —— 它不能当
+引导用：命令还没装进 PATH 时，`sudo vram-mode install` 只会得到
+`sudo: vram-mode: command not found`。
+
+> `~/.local/bin` 不在 sudo 的 `secure_path` 里。装到用户目录后，
+> `vram-mode status` 正常，但换模式要写绝对路径
+> （`sudo ~/.local/bin/vram-mode tty`，横幅也会这么提示），或者直接用
+> 默认的 `/usr/local/bin` 安装。`PREFIX=$HOME/.local` 不会装桌面/菜单入口。
+
 
 ## 用法
 
