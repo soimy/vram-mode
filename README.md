@@ -83,8 +83,10 @@ unit**（`systemd-run --system`）重新执行 —— 因为切换动作最后�
 4. `systemctl stop display-manager.service`（解析出来的真实 unit，不写死 sddm）
 5. `systemctl stop graphical.target`
 6. `pkill` 兜底还在的合成器（kwin/plasmashell/gnome-shell/Hyprland/sway/gamescope/Xorg）
-7. `systemctl start getty@ttyN` + `chvt N`，在 `/dev/ttyN` 上打印横幅
-   （首选会话原来的 VT；起不来就换一个空 VT）
+7. `systemctl start getty@ttyN`；仅在能检测到控制台宽度至少 2560 像素，且
+   `setfont` 和 Terminus 字体均已安装时，才在目标 VT 加载最大字号（优先
+   `ter-132n`，16×32）。低于 2560 像素、无法检测分辨率或缺少依赖时保留当前
+   字体设置。之后 `chvt N` 并打印横幅；首选会话原来的 VT，getty 起不来就换一个空 VT。
 
 `desktop` 是反过程：`systemctl start display-manager` →
 （Bazzite 上额外 `steamosctl switch-to-desktop-mode`）→ 轮询 `loginctl` 等

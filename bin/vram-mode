@@ -500,6 +500,59 @@ graceful_logout() {
 
 # --- console (VT) handover --------------------------------------------------
 
+# Pick the largest installed Terminus console font.  Installing the font package
+# alone does not make getty use it, so apply it explicitly to the target VT.
+terminus_console_font() {
+  local dir name ext
+  local -a sizes=(132 124 120 116 114 112)
+  local -a exts=(psf.gz psfu.gz psf psfu)
+  for name in "${sizes[@]}"; do
+    for dir in /usr/share/kbd/consolefonts /usr/share/consolefonts /usr/lib/kbd/consolefonts; do
+      for ext in "${exts[@]}"; do
+        if [[ -f $dir/ter-${name}n.$ext ]]; then
+          printf '%s\n' "$dir/ter-${name}n.$ext"
+          return 0
+        fi
+      done
+    done
+  done
+  return 1
+}
+
+console_pixel_width() {
+  local file width height info
+  for file in /sys/class/graphics/fb0/virtual_size /sys/class/graphics/fb*/virtual_size; do
+    [[ -r $file ]] || continue
+    IFS=, read -r width height < "$file" || continue
+    if [[ $width =~ ^[0-9]+$ && $height =~ ^[0-9]+$ ]]; then
+      printf '%s\n' "$width"
+      return 0
+    fi
+  done
+
+  if have fbset; then
+    info=$(fbset -s 2>/dev/null) || return 1
+    width=$(awk '$1 == "geometry" { print $2; exit }' <<<"$info")
+    [[ $width =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$width"
+    return 0
+  fi
+  return 1
+}
+
+set_console_font() {
+  local n=$1 font width dev=/dev/tty$1
+  have setfont || return 0
+  width=$(console_pixel_width) || return 0
+  ((width >= 2560)) || return 0
+  font=$(terminus_console_font) || return 0
+  if setfont -C "$dev" "$font" 2>/dev/null; then
+    step "loaded Terminus console font $(basename "$font" | sed 's/\.psf.*$//; s/\.psfu.*$//') on tty$n"
+  else
+    warn "could not load Terminus console font on tty$n; keeping the system default"
+  fi
+}
+
 tty_in_use() {
   local n=$1 s
   have loginctl || return 1
@@ -583,11 +636,13 @@ switch_console() {
 
   if [[ -z $ttyn ]]; then
     warn "could not start a getty; switching to tty$preferred anyway"
+    set_console_font "$preferred"
     chvt "$preferred" 2>/dev/null || true
     banner "$preferred"
     return 1
   fi
 
+  set_console_font "$ttyn"
   step "switching console to tty$ttyn"
   chvt "$ttyn" 2>/dev/null || warn "  chvt $ttyn failed"
   banner "$ttyn"
