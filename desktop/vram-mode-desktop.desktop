@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Back to Desktop (leave TTY mode)
+Comment=Start the Plasma session again after using the bare tty
+Exec=pkexec /usr/local/bin/vram-mode desktop
+Icon=preferences-desktop-display
+Terminal=false
+StartupNotify=false
+Categories=System;

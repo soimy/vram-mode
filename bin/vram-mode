@@ -1,0 +1,476 @@
+#!/usr/bin/env bash
+# vram-mode — flip bazzite-deck between the desktop session and a bare tty,
+# so ComfyUI / LLM work gets the whole GPU and most of the RAM.
+#
+#   vram-mode tty        desktop (or Deck UI) -> pure tty   [root]
+#   vram-mode desktop    pure tty -> Plasma desktop        [root]
+#   vram-mode game       pure tty -> Steam Deck UI         [root]
+#   vram-mode status     current mode + free VRAM/RAM
+#   vram-mode doctor     check every piece this box needs
+#   vram-mode install    copy to /usr/local/bin + install desktop icons [root]
+#
+# tty/desktop/game need root (VT handover, display manager). They re-exec
+# themselves as a transient *system* unit, so the switch survives the very
+# cgroup teardown it is performing. From a tty: `sudo vram-mode desktop`.
+# From the desktop: click the icon (pkexec).
+#
+# Add --dry-run to tty/desktop/game to see the plan without touching anything.
+
+set -uo pipefail
+
+PROG=vram-mode
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+PLASMA_SESSION=plasma.desktop
+DEST=/usr/local/bin/vram-mode
+DRY=0
+
+# --- tiny helpers -----------------------------------------------------------
+
+if [[ -t 1 ]]; then
+  C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_ERR=$'\033[31m'; C_DIM=$'\033[2m'; C_OFF=$'\033[0m'
+else
+  C_OK=""; C_WARN=""; C_ERR=""; C_DIM=""; C_OFF=""
+fi
+
+say()  { printf '%s\n' "$*"; }
+step() { printf '%s==>%s %s\n' "$C_DIM" "$C_OFF" "$*"; }
+ok()   { printf '%s %s%s\n' "$C_OK" "✔" "$*$C_OFF"; }
+warn() { printf '%s%s%s\n' "$C_WARN" "$*" "$C_OFF" >&2; }
+die()  { printf '%s%s%s\n' "$C_ERR" "$*" "$C_OFF" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# How the user should invoke us: sudo's secure_path excludes ~/.local/bin, so
+# point at the installed copy once it exists.
+hint() {
+  if [[ -x $DEST ]]; then printf '%s %s' "sudo $PROG" "$1"
+  else printf '%s %s' "sudo $SELF" "$1"; fi
+}
+
+# run <cmd...> — honours --dry-run
+run() {
+  if ((DRY)); then printf '  %s+%s %s\n' "$C_DIM" "$C_OFF" "$*"; return 0; fi
+  "$@"
+}
+
+vram_used() {
+  if have nvidia-smi; then
+    nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -n1 | tr -d ' '
+  elif compgen -G '/sys/class/drm/card*/device/mem_info_vram_used' >/dev/null; then
+    local f t=0; for f in /sys/class/drm/card*/device/mem_info_vram_used; do t=$((t + $(<"$f"))); done
+    echo $((t / 1048576))
+  fi
+}
+
+vram_total() {
+  if have nvidia-smi; then
+    nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -n1 | tr -d ' '
+  elif compgen -G '/sys/class/drm/card*/device/mem_info_vram_total' >/dev/null; then
+    local f t=0; for f in /sys/class/drm/card*/device/mem_info_vram_total; do t=$((t + $(<"$f"))); done
+    echo $((t / 1048576))
+  fi
+}
+
+ram_used_mib()  { awk '/^MemTotal:/{t=$2}/^MemAvailable:/{a=$2}END{print int((t-a)/1024)}' /proc/meminfo; }
+ram_avail_mib() { awk '/^MemAvailable:/{print int($2/1024)}' /proc/meminfo; }
+
+first_uid() {
+  local d id
+  for d in /run/user/[0-9]*; do
+    id=${d##*/}
+    ((id >= 1000)) && { echo "$id"; return; }
+  done
+  id -u 1000
+}
+
+# uid that asked for this (survives sudo/pkexec but *not* systemd-run)
+invoking_uid() {
+  local u=""
+  [[ -n ${SUDO_UID:-} ]] && u=$SUDO_UID
+  [[ -z $u && -n ${PKEXEC_UID:-} ]] && u=$PKEXEC_UID
+  [[ -z $u ]] && u=$(first_uid)
+  echo "$u"
+}
+
+# as_user <uid> <cmd...> — with a usable session bus + runtime dir
+as_user() {
+  local uid=$1; shift
+  local user rt home
+  user=$(id -un "$uid" 2>/dev/null) || return 1
+  rt=/run/user/$uid
+  home=$(getent passwd "$uid" | cut -d: -f6)
+  runuser -u "$user" -- env \
+    XDG_RUNTIME_DIR="$rt" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=$rt/bus" \
+    HOME="$home" USER="$user" LOGNAME="$user" \
+    "$@"
+}
+
+game_running() { pgrep -x gamescope >/dev/null 2>&1; }
+
+current_mode() {
+  if pgrep -u "$(invoking_uid)" -x plasmashell >/dev/null 2>&1; then echo desktop
+  elif game_running; then echo game
+  elif systemctl is-active --quiet sddm 2>/dev/null; then echo login
+  else echo tty; fi
+}
+
+# first tty that already has a logged-in session for this user, else tty2
+pick_tty() {
+  local uid=$1 s t
+  for s in $(loginctl list-sessions --no-legend 2>/dev/null | awk -v u="$uid" '$2==u {print $1}'); do
+    t=$(loginctl show-session "$s" -p TTY --value 2>/dev/null)
+    if [[ $t =~ ^tty([0-9]+)$ ]]; then echo "${BASH_REMATCH[1]}"; return; fi
+  done
+  echo 2
+}
+
+plasma_pids() { pgrep -u "$1" -x plasmashell 2>/dev/null | sort | tr '\n' ' '; }
+
+# wait for a plasmashell pid that was NOT there before the switch started.
+# ("a plasmashell exists" is not proof: on a live session it is trivially true,
+# and steamosctl may be about to tear that very session down.)
+wait_new_plasma() {
+  local uid=$1 secs=$2 before=$3 i cur
+  for ((i = 0; i < secs * 2; i++)); do
+    cur=$(plasma_pids "$uid")
+    if [[ -n $cur && $cur != "$before" ]]; then return 0; fi
+    sleep 0.5
+  done
+  return 1
+}
+
+banner() {
+  local n=$1 dev=/dev/tty$1 v u t
+  v=$(vram_used); t=$(vram_total); u=$(ram_avail_mib)
+  [[ -c $dev ]] || return 0
+  {
+    printf '\033[H\033[2J'
+    printf '  ┌────────────────────────────────────────────────────┐\n'
+    printf '  │  TTY MODE — desktop session is off                 │\n'
+    printf '  └────────────────────────────────────────────────────┘\n'
+    printf '     VRAM : %s MiB used / %s MiB total  (%s MiB free)\n' "${v:-?}" "${t:-?}" "$((${t:-0} - ${v:-0}))"
+    printf '     RAM  : %s MiB available\n' "${u:-?}"
+    printf '\n'
+    printf '     back to desktop : %s\n' "$(hint desktop)"
+    printf '     back to Deck UI : %s\n' "$(hint game)"
+    printf '     status          : %s\n' "$PROG status"
+    printf '\n'
+  } >"$dev" 2>/dev/null || true
+}
+
+# --- the actual switch: tty ------------------------------------------------
+
+do_tty() {
+  local uid=${1:-$(first_uid)} user before ttyn
+
+  user=$(id -un "$uid" 2>/dev/null) || die "no user with uid $uid"
+  logger -t "$PROG" "tty mode requested for uid $uid ($user)"
+  step "tty mode for $user (uid $uid)"
+  before=$(vram_used)
+
+  # 1. their apps (chrome, steam, terminals, portals) — kills this very
+  #    session, which is why we are a transient system unit.
+  step "stopping app.slice"
+  run as_user "$uid" systemctl --user stop app.slice
+
+  # app.slice contains dbus.socket/dbus-broker. Leaving the session bus dead
+  # breaks every later `podman`/`distrobox` call with
+  #   "crun: sd-bus call: ... OCI permission denied"
+  # because crun falls back to the *system* bus, where polkit refuses it.
+  step "restarting the user session bus"
+  run as_user "$uid" systemctl --user start dbus.socket
+
+  # 2. the Plasma session itself (kwin, plasmashell, kded, ...)
+  step "stopping graphical-session.target"
+  run as_user "$uid" systemctl --user stop graphical-session.target
+  run as_user "$uid" systemctl --user stop plasma-workspace.target
+
+  # 3. the display manager and everything else graphical.
+  #    (not `systemctl isolate`: that would also stop this transient unit)
+  step "stopping graphical.target + sddm"
+  run systemctl stop graphical.target
+  run systemctl stop sddm.service
+
+  # 4. belt and braces
+  if ((!DRY)); then
+    pkill -TERM -u "$uid" -x kwin_wayland 2>/dev/null
+    pkill -TERM -u "$uid" -x plasmashell  2>/dev/null
+    pkill -TERM -u "$uid" -x gamescope    2>/dev/null   # Deck UI, if we were in it
+    sleep 1
+    pgrep -u "$uid" -x kwin_wayland >/dev/null 2>&1 && pkill -KILL -u "$uid" -x kwin_wayland 2>/dev/null
+    pgrep -u "$uid" -x plasmashell   >/dev/null 2>&1 && pkill -KILL -u "$uid" -x plasmashell  2>/dev/null
+    sleep 1
+  fi
+
+  ttyn=$(pick_tty "$uid")
+  step "switching console to tty$ttyn"
+  run systemctl start "getty@tty${ttyn}.service"
+  run chvt "$ttyn"
+  ((DRY)) || banner "$ttyn"
+
+  local after vram_after total
+  after=$(vram_used); total=$(vram_total)
+  ((DRY)) && return 0
+  say ""
+  ok "tty mode active — VRAM ${before:-?} -> ${after:-?} MiB used of ${total:-?} MiB"
+  say "   RAM available: $(ram_avail_mib) MiB"
+  say "   return with  : $(hint desktop)"
+  logger -t "$PROG" "tty mode: vram ${before}->${after} MiB, session stopped for uid $uid"
+}
+
+# --- the actual switch: desktop / game ------------------------------------
+
+do_desktop() {
+  local uid=${1:-$(first_uid)} user before_pids
+
+  user=$(id -un "$uid" 2>/dev/null) || die "no user with uid $uid"
+  before_pids=$(plasma_pids "$uid")
+
+  # Already there? Do nothing. Bouncing a live session through steamosctl is
+  # what left the box with no session at all on 2025-10-19.
+  if [[ -n $before_pids ]]; then
+    say "Plasma is already running (pid ${before_pids% }) — nothing to switch."
+    return 0
+  fi
+
+  logger -t "$PROG" "desktop mode requested for uid $uid"
+  step "restoring desktop mode for $user"
+
+  # steamosctl talks to steamos-manager over the session bus
+  as_user "$uid" systemctl --user start dbus.socket >/dev/null 2>&1 || true
+
+  # 0. SDDM has to be up: steamos-manager stops the old session and lets the
+  #    display manager autologin the next one. From a bare tty it is stopped,
+  #    so the vendor switch otherwise kills the session and nothing restarts.
+  if ! systemctl is-active --quiet sddm 2>/dev/null; then
+    step "starting the display manager (sddm)"
+    run systemctl start sddm
+    ((DRY)) || sleep 6
+  fi
+
+  # 1. vendor path — exactly what the Deck's own "Switch to Desktop" runs
+  if have steamosctl; then
+    step "steamosctl switch-to-desktop-mode $PLASMA_SESSION"
+    run as_user "$uid" steamosctl switch-to-desktop-mode "$PLASMA_SESSION" || warn "  steamosctl returned non-zero"
+    if ((!DRY)) && wait_new_plasma "$uid" 35 "$before_pids"; then
+      ok "Plasma is back"; return 0
+    fi
+  fi
+
+  # 2. generic systemd path
+  step "falling back to systemctl start graphical.target"
+  run systemctl start graphical.target
+  if ((!DRY)) && wait_new_plasma "$uid" 20 "$before_pids"; then
+    ok "Plasma is back"; return 0
+  fi
+
+  ((DRY)) && return 0
+
+  warn "desktop session did not come up automatically."
+  say ""
+  say "  Run these yourself, in order:"
+  say "    dbus-run-session startplasma-wayland    # sddm-free, run in THIS tty"
+  say "    sudo systemctl start sddm"
+  say "    sudo steamosctl switch-to-desktop-mode $PLASMA_SESSION"
+  say "    sudo steamosctl switch-to-game-mode     # Deck UI, then Switch to Desktop"
+  say ""
+  logger -t "$PROG" "desktop mode FAILED for uid $uid"
+  return 1
+}
+
+do_game() {
+  local uid=${1:-$(first_uid)}
+  if game_running; then
+    say "game mode already running — nothing to switch."
+    return 0
+  fi
+  step "restoring game mode"
+  if have steamosctl; then
+    run as_user "$uid" steamosctl switch-to-game-mode
+  else
+    run systemctl start graphical.target
+  fi
+  ((DRY)) || say "  (the Deck UI should appear; from it pick 'Switch to Desktop' if wanted)"
+}
+
+# --- detach ----------------------------------------------------------------
+
+# The switch kills the cgroup it is launched from, so run it as a transient
+# *system* unit: system.slice is untouched by user-slice teardown.
+# (Deliberately no `systemctl isolate` anywhere: isolate would also stop the
+# transient unit that is performing the switch.)
+detach() {
+  local action=$1 uid=${2:-$(invoking_uid)} unit
+  unit="vram-mode-${action}-$(date +%s)"
+
+  if ((EUID != 0)); then
+    say "elevating with sudo…"
+    exec sudo -- "$SELF" __real "$action" "$uid"
+  fi
+
+  if ((DRY)); then
+    printf '  %s+%s systemd-run --system --unit=%s %s __do %s %s\n' \
+      "$C_DIM" "$C_OFF" "$unit" "$SELF" "$action" "$uid"
+    return 0
+  fi
+
+  say "switching in the background (it outlives the session it shuts down)"
+  if ! systemd-run --system --collect --quiet \
+        --unit="$unit" --description="vram-mode: $action" \
+        "$SELF" __do "$action" "$uid"; then
+    die "could not start the transient unit (systemd-run failed)"
+  fi
+  say "  progress: journalctl -t $PROG -f"
+}
+
+# --- subcommands -----------------------------------------------------------
+
+cmd_status() {
+  local uid v t
+  uid=$(invoking_uid)
+  v=$(vram_used); t=$(vram_total)
+  printf '%-18s %s\n' "Mode"        "$(current_mode)"
+  printf '%-18s %s / %s MiB  (%s free)\n' "VRAM" "${v:-?}" "${t:-?}" "$((${t:-0} - ${v:-0}))"
+  printf '%-18s %s MiB used, %s MiB available\n' "RAM" "$(ram_used_mib)" "$(ram_avail_mib)"
+  printf '%-18s %s\n' "Plasma"      "$(pgrep -u "$uid" -x plasmashell >/dev/null 2>&1 && echo running || echo stopped)"
+  printf '%-18s %s\n' "sddm"        "$(systemctl is-active sddm 2>/dev/null)"
+  if have steamosctl; then
+    printf '%-18s %s\n' "login mode"  "$(steamosctl get-default-login-mode 2>/dev/null || echo '?')"
+    printf '%-18s %s\n' "desk session" "$(steamosctl get-default-desktop-session 2>/dev/null || echo '?')"
+  fi
+  printf '%-18s %s\n' "installed"   "$([[ -x $DEST ]] && echo "$DEST" || echo 'no — run: sudo '"$PROG"' install')"
+}
+
+cmd_doctor() {
+  local miss=0 c
+  say "binaries:"
+  for c in systemd-run runuser chvt loginctl pkexec pkill nvidia-smi steamosctl; do
+    if have "$c"; then printf '  %s✔%s %s\n' "$C_OK" "$C_OFF" "$c"
+    else printf '  %s✘%s %s %s(downstream features degrade)%s\n' "$C_ERR" "$C_OFF" "$c" "$C_DIM" "$C_OFF"; ((miss++)); fi
+  done
+  say ""
+  say "units / state:"
+  printf '  sddm          : %s (%s)\n' "$(systemctl is-active sddm 2>/dev/null)" "$(systemctl is-enabled sddm 2>/dev/null)"
+  printf '  default target: %s\n' "$(systemctl get-default)"
+  printf '  plasma target : %s\n' "$(systemctl --user list-unit-files plasma-workspace-wayland.target --no-legend 2>/dev/null | awk '{print $1}' | head -1)"
+  printf '  root copy     : %s\n' "$([[ -x $DEST ]] && echo "$DEST" || echo 'MISSING — run: sudo '"$PROG"' install')"
+  printf '  desktop icon  : %s\n' "$([[ -f ${HOME}/Desktop/free-vram-tty.desktop ]] && echo yes || echo no)"
+  say ""
+  say "session stack:"
+  [[ -x /usr/libexec/os-session-select || -x /usr/lib/os-session-select ]] && say "  os-session-select : present (vendor switching)"
+  [[ -x /usr/libexec/bazzite-autologin ]] && say "  bazzite-autologin : present"
+  say "  default autologin session: $(grep -h '^Session=' /etc/sddm.conf.d/*.conf 2>/dev/null | tail -1 | cut -d= -f2)"
+  ((miss == 0)) && ok "nothing missing" || warn "$miss command(s) missing"
+}
+
+cmd_install() {
+  local uid home desk apps
+  if ((EUID != 0)); then
+    say "installing to $DEST needs root once:"
+    exec sudo -- "$SELF" install
+  fi
+  uid=$(invoking_uid)
+  home=$(getent passwd "$uid" | cut -d: -f6)
+  desk=$home/Desktop
+  apps=$home/.local/share/applications
+  [[ -d $desk ]] || desk=$home
+  mkdir -p "$apps"
+
+  install -m 755 "$SELF" "$DEST"
+  say "installed $DEST"
+
+  cat >"$apps/free-vram-tty.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Free VRAM (pure TTY)
+Name[zh_CN]=释放显存（纯 TTY）
+Comment=Stop the desktop session and switch to a bare tty for ComfyUI / LLM work
+Comment[zh_CN]=关闭桌面会话并切换到纯 TTY，把显存和内存让给 ComfyUI / LLM
+Exec=pkexec $DEST tty
+Icon=video-display
+Terminal=false
+StartupNotify=false
+Categories=System;
+Keywords=vram;tty;gpu;comfyui;llm;显存;
+Actions=desktop;
+
+[Desktop Action desktop]
+Name=Back to Desktop
+Exec=pkexec $DEST desktop
+EOF
+
+  cat >"$apps/vram-mode-desktop.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Back to Desktop (leave TTY mode)
+Comment=Start the Plasma session again after using the bare tty
+Exec=pkexec $DEST desktop
+Icon=preferences-desktop-display
+Terminal=false
+StartupNotify=false
+Categories=System;
+EOF
+
+  install -m 755 "$apps/free-vram-tty.desktop" "$desk/free-vram-tty.desktop"
+  chown "$uid:$uid" "$apps"/*.desktop "$desk/free-vram-tty.desktop" 2>/dev/null
+
+  say "icon on desktop : $desk/free-vram-tty.desktop"
+  say "app menu entries: free-vram-tty, vram-mode-desktop"
+  say ""
+  say "from a tty:   sudo $PROG tty | desktop | game | status"
+  say "from desktop: click 'Free VRAM (pure TTY)'"
+}
+
+usage() {
+  sed -n '2,17p' "$SELF" | sed -E 's/^#( |$)//'
+}
+
+# --- main ------------------------------------------------------------------
+
+[[ $# -eq 0 ]] && { usage; exit 0; }
+
+# global --dry-run, anywhere on the line
+args=()
+for a in "$@"; do
+  case "$a" in
+    --dry-run|-n) DRY=1 ;;
+    *) args+=("$a") ;;
+  esac
+done
+set -- "${args[@]:-}"
+if ((${#args[@]} == 0)); then usage; exit 0; fi
+set -- "${args[@]}"
+
+action=$1; shift
+
+case "$action" in
+  tty|desktop|game)
+    if ((DRY)); then
+      case "$action" in
+        tty)     do_tty     "$(invoking_uid)" ;;
+        desktop) do_desktop "$(invoking_uid)" ;;
+        game)    do_game    "$(invoking_uid)" ;;
+      esac
+    else
+      detach "$action" "$(invoking_uid)"
+    fi
+    ;;
+  __real)   # elevated, foreground, invoked by detach(): go detached
+    cmda=$1; shift
+    detach "$cmda" "${1:-$(first_uid)}"
+    ;;
+  __do)     # runs inside the transient system unit
+    cmda=$1; shift
+    u=${1:-$(first_uid)}
+    case "$cmda" in
+      tty)     do_tty     "$u" ;;
+      desktop) do_desktop "$u" ;;
+      game)    do_game    "$u" ;;
+    esac
+    ;;
+  status)   cmd_status ;;
+  doctor)   cmd_doctor ;;
+  install)  cmd_install ;;
+  -h|--help|help) usage ;;
+  *) die "unknown action '$action' (try: $PROG help)" ;;
+esac

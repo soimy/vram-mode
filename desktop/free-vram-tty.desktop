@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Application
+Name=Free VRAM (pure TTY)
+Name[zh_CN]=释放显存（纯 TTY）
+Comment=Stop the desktop session and switch to a bare tty for ComfyUI / LLM work
+Comment[zh_CN]=关闭桌面会话并切换到纯 TTY，把显存和内存让给 ComfyUI / LLM
+Exec=pkexec /usr/local/bin/vram-mode tty
+Icon=video-display
+Terminal=false
+StartupNotify=false
+Categories=System;
+Keywords=vram;tty;gpu;comfyui;llm;显存;
+Actions=desktop;
+
+[Desktop Action desktop]
+Name=Back to Desktop
+Exec=pkexec /usr/local/bin/vram-mode desktop
