@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# free-vram — reclaim GPU memory held by leftover Chrome and Steam.
+# free-vram — reclaim GPU memory held by leftover Chrome/Chromium and Steam.
 #
-# Touches ONLY:
-#   * flatpak Chrome  (com.google.Chrome instances + its autostart unit)
-#   * Steam           (app-steam@autostart.service and its whole cgroup)
-# It never touches plasmashell, kwin_wayland, Xwayland or the rest of a session.
+# Works with native installs and with flatpak, and with the Bazzite/SteamOS
+# autostart units.  Touches ONLY:
+#   * Chrome / Chromium processes (native) and flatpak Chrome / Chromium
+#   * Steam (client, webhelpers, pressure-vessel) and app-steam@autostart
+# It never touches the compositor, the shell or the rest of the session.
 #
 # Usage:
 #   free-vram                kill Chrome + Steam, then report the VRAM delta
@@ -19,8 +20,9 @@
 
 set -uo pipefail
 
-CHROME_APP_ID="com.google.Chrome"
 STEAM_UNIT="app-steam@autostart.service"
+FLATPAK_CHROME_IDS=(com.google.Chrome org.chromium.Chromium)
+NATIVE_CHROME_NAMES=(chrome chromium chromium-browser google-chrome google-chrome-stable)
 
 TIMEOUT=10
 DO_CHROME=1
@@ -29,7 +31,21 @@ DRY_RUN=0
 STATUS_ONLY=0
 
 usage() {
-  sed -n '2,19p' "${BASH_SOURCE[0]}" | sed -E 's/^#( |$)//'
+  cat <<'EOF'
+free-vram — reclaim GPU memory held by leftover Chrome/Chromium and Steam.
+
+Usage: free-vram [options]
+
+  (no options)     kill Chrome + Steam, then report the VRAM delta
+  --dry-run        show what would be killed, change nothing
+  --status         print VRAM + current holders, kill nothing
+  --no-chrome      Steam only
+  --no-steam       Chrome only
+  --timeout N      seconds to wait for a clean exit (default 10)
+  -h, --help       this text
+
+Exit status: 0 = everything targeted is gone, 1 = something survived.
+EOF
   exit "${1:-0}"
 }
 
@@ -49,9 +65,9 @@ done
 # --- plumbing ---------------------------------------------------------------
 
 if [[ -t 1 ]]; then
-  C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_ERR=$'\033[31m'; C_DIM=$'\033[2m'; C_OFF=$'\033[0m'
+  C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_DIM=$'\033[2m'; C_OFF=$'\033[0m'
 else
-  C_OK=""; C_WARN=""; C_ERR=""; C_DIM=""; C_OFF=""
+  C_OK=""; C_WARN=""; C_DIM=""; C_OFF=""
 fi
 
 log()  { printf '%s\n' "$*"; }
@@ -66,7 +82,7 @@ if [[ -z "${XDG_RUNTIME_DIR:-}" || ! -d "${XDG_RUNTIME_DIR:-/nonexistent}" ]]; t
 fi
 
 if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
-  printf 'free-vram: run as your normal user, not root (all targets are --user units)\n' >&2
+  printf 'free-vram: run as your normal user, not root (the targets belong to you)\n' >&2
   exit 2
 fi
 
@@ -74,35 +90,58 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 # --- GPU probe --------------------------------------------------------------
 
-vram_used() {
-  if have nvidia-smi; then
-    nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | head -n1 | tr -d ' '
-  elif compgen -G '/sys/class/drm/card*/device/mem_info_vram_used' >/dev/null; then
-    local f total=0
-    for f in /sys/class/drm/card*/device/mem_info_vram_used; do total=$((total + $(<"$f"))); done
-    echo $((total / 1048576))
+gpu_backend() {
+  if have nvidia-smi && nvidia-smi --query-gpu=memory.total \
+       --format=csv,noheader,nounits >/dev/null 2>&1; then
+    echo nvidia; return
   fi
+  if compgen -G '/sys/class/drm/card*/device/mem_info_vram_total' >/dev/null; then
+    echo amdgpu; return
+  fi
+  echo none
+}
+
+vram_used() {
+  local v f total=0 found=0
+  if have nvidia-smi; then
+    v=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null \
+          | head -n1 | tr -d ' ')
+    [[ $v =~ ^[0-9]+$ ]] && { echo "$v"; return; }
+  fi
+  for f in /sys/class/drm/card*/device/mem_info_vram_used; do
+    [[ -r $f ]] || continue
+    v=$(<"$f"); [[ $v =~ ^[0-9]+$ ]] || continue
+    total=$((total + v)); found=1
+  done
+  ((found)) && echo $((total / 1048576))
+  return 0
 }
 
 vram_total() {
+  local v f total=0 found=0
   if have nvidia-smi; then
-    nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -n1 | tr -d ' '
-  elif compgen -G '/sys/class/drm/card*/device/mem_info_vram_total' >/dev/null; then
-    local f total=0
-    for f in /sys/class/drm/card*/device/mem_info_vram_total; do total=$((total + $(<"$f"))); done
-    echo $((total / 1048576))
+    v=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null \
+          | head -n1 | tr -d ' ')
+    [[ $v =~ ^[0-9]+$ ]] && { echo "$v"; return; }
   fi
+  for f in /sys/class/drm/card*/device/mem_info_vram_total; do
+    [[ -r $f ]] || continue
+    v=$(<"$f"); [[ $v =~ ^[0-9]+$ ]] || continue
+    total=$((total + v)); found=1
+  done
+  ((found)) && echo $((total / 1048576))
+  return 0
 }
 
 gpu_name() {
-  if have nvidia-smi; then
-    nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n1
-  fi
+  [[ $(gpu_backend) == nvidia ]] || return 0
+  nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n1 \
+    | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
 }
 
 # Every process the driver says is holding VRAM, as "pid<TAB>MiB".
 gpu_procs() {
-  have nvidia-smi || return 0
+  [[ $(gpu_backend) == nvidia ]] || return 0
   nvidia-smi 2>/dev/null | sed -n '/Processes:/,/^$/p' | grep -E '[0-9]+MiB' | while IFS= read -r line; do
     [[ $line =~ ([0-9]+)MiB ]] || continue
     local mib="${BASH_REMATCH[1]}" pid=""
@@ -112,67 +151,116 @@ gpu_procs() {
   done
 }
 
-# --- Chrome -----------------------------------------------------------------
+# --- Chrome / Chromium ------------------------------------------------------
 
-chrome_instances() {
+# native browser processes: the browser and its renderers share the same name
+chrome_pids() {
+  have pgrep || return 0
+  local n
+  for n in "${NATIVE_CHROME_NAMES[@]}"; do
+    pgrep -u "$(id -u)" -x "$n" 2>/dev/null
+  done | sort -un | grep -vx "$$" || true
+}
+
+flatpak_chrome_ids() {
   have flatpak || return 0
-  flatpak ps --columns=instance,application 2>/dev/null \
-    | awk -v id="$CHROME_APP_ID" '$2 == id { print $1 }' || true
+  local id
+  for id in "${FLATPAK_CHROME_IDS[@]}"; do
+    flatpak info "$id" >/dev/null 2>&1 && printf '%s\n' "$id"
+  done
 }
 
-# Instance scopes that are still registered with the user manager.
+# running flatpak instances, as "instance<TAB>app-id"
+flatpak_chrome_instances() {
+  have flatpak || return 0
+  local ps ids
+  ps=$(flatpak ps --columns=instance,application 2>/dev/null) || return 0
+  [[ -n $ps ]] || return 0
+  ids=$(flatpak_chrome_ids)
+  [[ -n $ids ]] || return 0
+  printf '%s\n' "$ps" | awk -v ids="$ids" '
+    BEGIN { n=split(ids, a, "\n") }
+    { for (i=1; i<=n; i++) if ($2 == a[i]) { print; break } }'
+}
+
+# Instance scopes still registered with the user manager (flatpak Chrome).
 chrome_scopes() {
-  systemctl --user list-units --type=scope --state=active --no-legend --no-pager 2>/dev/null \
-    | grep -oE "app-flatpak-${CHROME_APP_ID//./\\.}-[0-9]+\.scope" | sort -u || true
+  have systemctl || return 0
+  local id pat out
+  out=$(systemctl --user list-units --type=scope --state=active --no-legend --no-pager 2>/dev/null) || return 0
+  for id in "${FLATPAK_CHROME_IDS[@]}"; do
+    pat="app-flatpak-${id//./\\.}-[0-9]+\.scope"
+    printf '%s\n' "$out" | grep -oE "$pat"
+  done | sort -u || true
 }
 
-# Autostart unit generated from the flatpak's exported .desktop file.
+# Autostart units generated from the browser's exported .desktop file.
 chrome_units() {
+  have systemctl || return 0
   systemctl --user list-units --type=service --state=active --no-legend --no-pager 2>/dev/null \
-    | grep -oE 'app-flatpak-com\.google\.Chrome@[A-Za-z0-9]+\.service|app-com\.google\.Chrome@[A-Za-z0-9]+\.service' \
+    | grep -oE 'app-(flatpak-)?com\.google\.Chrome@[A-Za-z0-9]+\.service|app-(flatpak-)?org\.chromium\.Chromium@[A-Za-z0-9]+\.service' \
     | sort -u || true
 }
 
 chrome_count() {
-  local n
-  n=$(chrome_instances | wc -l)
-  # flatpak ps unavailable (or app already gone) -> fall back to unit scopes
-  ((n == 0)) && n=$(chrome_scopes | wc -l)
-  echo "$n"
+  local n f
+  n=$(chrome_pids | wc -l)
+  f=$(flatpak_chrome_instances | wc -l)
+  ((n == 0 && f == 0)) && n=$(chrome_scopes | wc -l)
+  echo $((n + f))
+}
+
+chrome_summary() {
+  printf '%s native pid(s), %s flatpak instance(s)\n' \
+    "$(chrome_pids | wc -l)" "$(flatpak_chrome_instances | wc -l)"
 }
 
 stop_chrome() {
-  local instances scopes units
-  instances=$(chrome_instances)
+  local pids ids instances scopes units u
+
+  pids=$(chrome_pids)
+  ids=$(flatpak_chrome_ids)
+  instances=$(flatpak_chrome_instances)
   scopes=$(chrome_scopes)
   units=$(chrome_units)
 
-  if [[ -z $instances && -z $scopes && -z $units ]]; then
+  if [[ -z $pids && -z $instances && -z $scopes && -z $units ]]; then
     log "[chrome] not running"
     return 0
   fi
 
   if [[ $DRY_RUN -eq 1 ]]; then
-    log "[chrome] would stop: $(tr '\n' ' ' <<<"$instances")"
-    [[ -n $scopes ]] && log "         scopes: $(tr '\n' ' ' <<<"$scopes")"
-    [[ -n $units  ]] && log "         units:  $(tr '\n' ' ' <<<"$units")"
+    [[ -n $instances ]] && log "[chrome] would stop flatpak: $(tr '\n' ' ' <<<"$instances")"
+    [[ -n $pids      ]] && log "[chrome] would kill native pids: $(tr '\n' ' ' <<<"$pids")"
+    [[ -n $scopes    ]] && log "         scopes: $(tr '\n' ' ' <<<"$scopes")"
+    [[ -n $units     ]] && log "         units:  $(tr '\n' ' ' <<<"$units")"
     return 0
   fi
 
-  log "[chrome] stopping ${CHROME_APP_ID} (${instances//$'\n'/ } )"
-  # flatpak kill sends SIGTERM to every instance -> Chrome saves state and exits.
-  have flatpak && flatpak kill "$CHROME_APP_ID" >/dev/null 2>&1
+  # flatpak kill sends SIGTERM to every instance -> Chrome saves state and exits
+  if [[ -n $instances ]]; then
+    log "[chrome] stopping flatpak (app ids: $(tr '\n' ' ' <<<"$ids"))"
+    local id
+    for id in $ids; do flatpak kill "$id" >/dev/null 2>&1 || true; done
+  fi
+
+  # native: SIGTERM the browser process; renderers follow it down
+  if [[ -n $pids ]]; then
+    log "[chrome] stopping native browser (pids: $(tr '\n' ' ' <<<"$pids"))"
+    printf '%s\n' "$pids" | xargs -r kill -TERM 2>/dev/null || true
+  fi
 
   if ! wait_count_zero "$TIMEOUT" chrome_count; then
     warn "[chrome] still alive after ${TIMEOUT}s -> SIGKILL"
-    while IFS= read -r s; do
-      [[ -n $s ]] && systemctl --user kill -s SIGKILL "$s" >/dev/null 2>&1
+    pids=$(chrome_pids)
+    [[ -n $pids ]] && printf '%s\n' "$pids" | xargs -r kill -9 2>/dev/null || true
+    while IFS= read -r u; do
+      [[ -n $u ]] && systemctl --user kill -s SIGKILL "$u" >/dev/null 2>&1
     done <<<"$(chrome_scopes)"
     wait_count_zero 3 chrome_count || true
   fi
 
   # Sweep whatever is left of the generated autostart units / scopes.
-  local u
   for u in $units $(chrome_scopes); do
     systemctl --user stop "$u" >/dev/null 2>&1 || true
     systemctl --user reset-failed "$u" >/dev/null 2>&1 || true
@@ -182,33 +270,47 @@ stop_chrome() {
 
 # --- Steam ------------------------------------------------------------------
 
-# Anything the Steam client tree would leave behind.
+# The Steam client tree: native, Bazzite-flavoured and steam-runtime processes.
 steam_pids() {
   have pgrep || return 0
-  pgrep -f -- '\.local/share/Steam/(ubuntu12_32/steam|ubuntu12_64/steamwebhelper|steamrt64)|steam-runtime-launcher-service|bazzite-steam' 2>/dev/null \
+  pgrep -f -- '\.local/share/Steam/|steam-runtime-launcher-service|(^|/)steam( |$)|steamwebhelper' 2>/dev/null \
     | grep -vx "$$" || true
 }
 
 steam_count() { steam_pids | wc -l; }
 
+steam_unit_active() {
+  have systemctl && systemctl --user -q is-active "$STEAM_UNIT" >/dev/null 2>&1
+}
+
 stop_steam() {
-  local n
+  local n pids
   n=$(steam_count)
 
-  if systemctl --user -q is-active "$STEAM_UNIT" >/dev/null 2>&1; then :; elif ((n == 0)); then
+  if ! steam_unit_active && ((n == 0)); then
     log "[steam] not running"
     return 0
   fi
 
   if [[ $DRY_RUN -eq 1 ]]; then
-    log "[steam] would stop ${STEAM_UNIT} (${n} process(es) in app-steam cgroup)"
+    if steam_unit_active; then
+      log "[steam] would stop ${STEAM_UNIT} (${n} process(es))"
+    else
+      log "[steam] would kill ${n} native process(es)"
+    fi
     return 0
   fi
 
-  log "[steam] stopping ${STEAM_UNIT} (${n} process(es))"
-  # KillMode=control-group: systemd SIGTERMs the whole cgroup (steam.sh, the
-  # 32-bit client, webhelpers, pressure-vessel), SIGKILLs after TimeoutStopSec.
-  systemctl --user stop "$STEAM_UNIT" >/dev/null 2>&1 || true
+  if steam_unit_active; then
+    log "[steam] stopping ${STEAM_UNIT} (${n} process(es))"
+    # KillMode=control-group: systemd SIGTERMs the whole cgroup (steam.sh, the
+    # 32-bit client, webhelpers, pressure-vessel), SIGKILLs after TimeoutStopSec.
+    systemctl --user stop "$STEAM_UNIT" >/dev/null 2>&1 || true
+  else
+    log "[steam] stopping native client (${n} process(es))"
+    pids=$(steam_pids)
+    [[ -n $pids ]] && printf '%s\n' "$pids" | xargs -r kill -TERM 2>/dev/null || true
+  fi
 
   if ! wait_count_zero "$TIMEOUT" steam_count; then
     warn "[steam] still alive after ${TIMEOUT}s -> SIGKILL"
@@ -235,13 +337,16 @@ report_summary() {
   local used total name
   used=$(vram_used); total=$(vram_total); name=$(gpu_name)
   [[ -n $name ]] && log "GPU   : ${name}"
-  if [[ -n $used && -n $total ]]; then
+  if [[ $used =~ ^[0-9]+$ && $total =~ ^[0-9]+$ ]]; then
     log "VRAM  : ${used} / ${total} MiB used  ($((total - used)) MiB free)"
+  else
+    log "VRAM  : n/a (no supported GPU probe)"
   fi
 }
 
 report_holders() {
   local out pid mib comm
+  [[ $(gpu_backend) == nvidia ]] || return 0
   # Capture first: piping straight into `grep -q` SIGPIPEs us under pipefail.
   out=$(gpu_procs)
   log "VRAM holders${C_DIM} (nvidia-smi)${C_OFF}:"
@@ -263,9 +368,11 @@ before=$(vram_used)
 if [[ $STATUS_ONLY -eq 1 ]]; then
   report_summary
   log
-  log "Chrome : $(chrome_count) instance(s) ${C_DIM}$(chrome_instances | tr '\n' ' ')${C_OFF}"
-  if systemctl --user -q is-active "$STEAM_UNIT" >/dev/null 2>&1; then
+  log "Chrome : $(chrome_summary)"
+  if steam_unit_active; then
     log "Steam  : running (${STEAM_UNIT}, $(steam_count) pid(s))"
+  elif (($(steam_count) > 0)); then
+    log "Steam  : running (native, $(steam_count) pid(s))"
   else
     log "Steam  : not running"
   fi
@@ -279,7 +386,6 @@ log
 report_summary
 log
 
-rc=0
 if ((DO_CHROME)); then stop_chrome; fi
 if ((DO_STEAM));  then stop_steam;  fi
 
@@ -292,7 +398,7 @@ fi
 log
 after=$(vram_used)
 report_summary
-if [[ -n $before && -n $after ]]; then
+if [[ $before =~ ^[0-9]+$ && $after =~ ^[0-9]+$ ]]; then
   delta=$((before - after))
   if ((delta > 0)); then
     printf '%s freed %s MiB %s\n' "$C_OK" "$delta" "$C_OFF"
@@ -301,9 +407,9 @@ if [[ -n $before && -n $after ]]; then
   fi
 fi
 
-# Anything of ours still alive?
+rc=0
 if ((DO_CHROME)) && [[ "$(chrome_count)" -ne 0 ]]; then
-  warn "chrome still has $(chrome_count) live instance/scope(s)"; rc=1
+  warn "chrome still has $(chrome_count) live pid/instance(s)"; rc=1
 fi
 if ((DO_STEAM)) && [[ "$(steam_count)" -ne 0 ]]; then
   warn "steam still has $(steam_count) live pid(s)"; rc=1
