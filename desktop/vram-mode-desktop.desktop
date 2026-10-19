@@ -1,7 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=Back to Desktop (leave TTY mode)
-Comment=Start the Plasma session again after using the bare tty
+Name=Back to Graphical Desktop (leave TTY mode)
+Name[zh_CN]=返回图形桌面（退出 TTY 模式）
+Comment=Start the graphical session again after using the bare console
+Comment[zh_CN]=用完纯 TTY 后重新启动图形会话
 Exec=pkexec /usr/local/bin/vram-mode desktop
 Icon=preferences-desktop-display
 Terminal=false
