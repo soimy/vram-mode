@@ -34,7 +34,16 @@ echo "✔ $BIN/free-vram"
 if [[ $PREFIX == /usr/local && -n $TARGET_HOME ]]; then
   apps="$TARGET_HOME/.local/share/applications"
   desk="$TARGET_HOME/Desktop"
+  user_bin="$TARGET_HOME/.local/bin"
+  target_group="$(id -gn "$TARGET_UID")"
   mkdir -p "$apps"
+  if ((EUID == 0)); then
+    install -d -m755 -o "$TARGET_UID" -g "$target_group" "$user_bin"
+  else
+    mkdir -p "$user_bin"
+  fi
+  ln -sfnT "$BIN/vram-mode" "$user_bin/vram-mode"
+  if ((EUID == 0)); then chown -h "$TARGET_UID:$target_group" "$user_bin/vram-mode"; fi
   install -m644 "$SRC/desktop/free-vram-tty.desktop"     "$apps/"
   install -m644 "$SRC/desktop/vram-mode-desktop.desktop" "$apps/"
   as_target() { if [[ $EUID -eq 0 && $TARGET_UID -ne 0 ]]; then runuser -u "$TARGET_USER" -- "$@"; else "$@"; fi; }
@@ -50,6 +59,7 @@ if [[ $PREFIX == /usr/local && -n $TARGET_HOME ]]; then
   else
     echo "– 桌面图标: 跳过（没有 $desk）"
   fi
+  echo "✔ 用户命令: $user_bin/vram-mode -> $BIN/vram-mode"
 elif [[ $PREFIX != /usr/local ]]; then
   echo "– 桌面/菜单入口: 跳过（PREFIX=$PREFIX）"
 fi

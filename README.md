@@ -40,6 +40,8 @@ PREFIX=$HOME/.local ./install.sh      # 或只装到 ~/.local/bin，不装桌面
 
 `./install.sh` 是**唯一的首次安装入口**：它同时装 `vram-mode` 和 `free-vram`，
 并在 `~/.local/share/applications` 放两个菜单入口（有 `~/Desktop` 时才放桌面图标）。
+系统安装还会让 `~/.local/bin/vram-mode` 链接到 `/usr/local/bin/vram-mode`，
+因此终端命令和桌面图标使用同一份已安装脚本。修改仓库脚本后重新运行 `./install.sh` 部署。
 
 装好之后，`sudo vram-mode install` 用于原地更新和补装菜单入口 —— 它不能当
 引导用：命令还没装进 PATH 时，`sudo vram-mode install` 只会得到
@@ -184,6 +186,14 @@ shell 都会被算成"游戏模式在跑"。判断用 `pgrep -x`（按进程名�
 
 **8. `install.sh` 曾经在没有 `~/Desktop` 时把图标装进 `$HOME`。** 现在
 `~/Desktop` 不存在就跳过桌面图标，只装菜单入口。
+
+**9. 新图形会话不一定会重新打开 PipeWire 的 PulseAudio 兼容 socket。**
+如果音量模块连接丢失，`desktop` 会先确认目标用户的 `pipewire.service` 正在运行，且
+`pipewire-pulse.socket` 单元已加载，再启动该 socket；没有活动 PipeWire 服务或兼容 socket
+的发行版会跳过，不影响原生 PulseAudio 或其它音频栈。
+
+**10. 用户命令和桌面图标必须指向同一份安装版本。** 系统安装会把
+`~/.local/bin/vram-mode` 改为指向已安装的 `/usr/local/bin/vram-mode`；`doctor` 会报告链接或版本不一致。
 
 ## 测试环境
 

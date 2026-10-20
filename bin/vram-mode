@@ -746,6 +746,18 @@ do_tty() {
 
 # --- the actual switch: desktop / game -------------------------------------
 
+restore_desktop_audio() {
+  local uid=$1 load_state
+  as_user "$uid" systemctl --user is-active --quiet pipewire.service || return 0
+  load_state=$(as_user "$uid" systemctl --user show pipewire-pulse.socket \
+    -p LoadState --value 2>/dev/null || true)
+  [[ $load_state == loaded ]] || return 0
+
+  step "restoring the PipeWire PulseAudio socket"
+  run as_user "$uid" systemctl --user start pipewire-pulse.socket ||
+    warn "  pipewire-pulse.socket 启动失败，音量模块可能仍无法连接"
+}
+
 do_desktop() {
   local uid=${1:-$(first_uid)} user sid dm auto
 
@@ -786,6 +798,7 @@ do_desktop() {
 
   step "waiting for a graphical session (up to 60s)"
   if sid=$(wait_graphical_session "$uid" 60); then
+    restore_desktop_audio "$uid"
     ok "graphical session $sid is up: $(desktop_label "$(desktop_kind "$sid" "$uid")")"
     log_msg "desktop mode up: session $sid for uid $uid"
     return 0
@@ -916,9 +929,12 @@ cmd_status() {
 }
 
 cmd_doctor() {
-  local miss=0 c uid sid kind dm auto apps home v t
+  local miss=0 c uid sid kind dm auto apps home v t user_cmd user_real dest_real
   uid=$(invoking_uid)
   home=$(getent passwd "$uid" | cut -d: -f6)
+  user_cmd=$home/.local/bin/vram-mode
+  user_real=$(readlink -m "$user_cmd" 2>/dev/null || true)
+  dest_real=$(readlink -m "$DEST" 2>/dev/null || true)
 
   say "platform:"
   for c in systemctl loginctl systemd-run runuser chvt pkexec logger; do
@@ -965,6 +981,17 @@ cmd_doctor() {
   say ""
   say "install:"
   printf '  root copy       : %s\n' "$([[ -x $DEST ]] && echo "$DEST" || echo "MISSING — run: sudo $PROG install")"
+  if [[ -n $dest_real && $user_real == "$dest_real" ]]; then
+    if [[ -L $user_cmd ]]; then
+      printf '  user command    : linked to installed copy\n'
+    else
+      printf '  user command    : is the installed copy\n'
+    fi
+  elif [[ -f $user_cmd && -f $DEST ]] && cmp -s "$user_cmd" "$DEST"; then
+    printf '  user command    : same content; run install to link it to the installed copy\n'
+  else
+    printf '  user command    : version mismatch — run sudo %s install\n' "$PROG"
+  fi
   apps=$home/.local/share/applications
   printf '  app entries     : %s\n' "$(ls "$apps"/free-vram-tty.desktop 2>/dev/null || echo "none — run: sudo $PROG install")"
   printf '  desktop icon    : %s\n' "$([[ -f $home/Desktop/free-vram-tty.desktop ]] && echo yes || echo no)"
@@ -976,10 +1003,13 @@ cmd_doctor() {
 }
 
 cmd_install() {
-  local uid home desk apps src dest_dir companion
+  local uid home desk apps src dest_dir companion user_bin user_cmd user_real dest_real group
   uid=$(invoking_uid)
   home=$(getent passwd "$uid" | cut -d: -f6)
+  group=$(id -gn "$uid")
   desk=$home/Desktop
+  user_bin=$home/.local/bin
+  user_cmd=$user_bin/vram-mode
   apps=${XDG_DATA_HOME:-$home/.local/share}/applications
   dest_dir=$(dirname "$DEST")
   companion=$dest_dir/free-vram
@@ -995,6 +1025,19 @@ cmd_install() {
     say "installed $DEST"
   else
     say "$DEST is already in place"
+  fi
+
+  user_real=$(readlink -m "$user_cmd" 2>/dev/null || true)
+  dest_real=$(readlink -m "$DEST" 2>/dev/null || true)
+  if [[ -n $dest_real && $user_real != "$dest_real" ]]; then
+    if ((EUID == 0)); then
+      install -d -m 755 -o "$uid" -g "$group" "$user_bin"
+    else
+      mkdir -p "$user_bin"
+    fi
+    ln -sfnT "$DEST" "$user_cmd" || die "could not link $user_cmd to $DEST"
+    if ((EUID == 0)); then chown -h "$uid:$group" "$user_cmd"; fi
+    say "linked $user_cmd -> $DEST"
   fi
 
   # companion helper, if this checkout has one
