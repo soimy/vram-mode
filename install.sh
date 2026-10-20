@@ -50,7 +50,7 @@ if [[ $PREFIX == /usr/local && -n $TARGET_HOME ]]; then
   as_target update-desktop-database "$apps" >/dev/null 2>&1 || true
   chown "$TARGET_UID:$TARGET_UID" "$apps/free-vram-tty.desktop" \
         "$apps/vram-mode-desktop.desktop" 2>/dev/null || true
-  echo "✔ 菜单入口: Free VRAM (pure TTY) / Back to Graphical Desktop"
+  echo "✔ 菜单入口: Switch to Pure TTY / Back to Graphical Desktop"
 
   if [[ -d $desk ]]; then
     install -m755 "$apps/free-vram-tty.desktop" "$desk/free-vram-tty.desktop"
@@ -67,7 +67,7 @@ fi
 cat <<EOF
 
 下一步：
-  从桌面切到纯 tty : 点菜单里的 Free VRAM (pure TTY)，或 sudo vram-mode tty
+  从桌面切到纯 tty : 点菜单里的 Switch to Pure TTY，或 sudo vram-mode tty
   回到图形桌面     : sudo vram-mode desktop
   看状态/自检      : vram-mode status | vram-mode doctor
   只杀 Chrome/Steam: free-vram

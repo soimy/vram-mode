@@ -1050,8 +1050,8 @@ cmd_install() {
   cat >"$apps/free-vram-tty.desktop" <<EOF
 [Desktop Entry]
 Type=Application
-Name=Free VRAM (pure TTY)
-Name[zh_CN]=释放显存（纯 TTY）
+Name=Switch to Pure TTY
+Name[zh_CN]=Switch to Pure TTY
 Comment=Stop the graphical session and switch to a bare console for ComfyUI / LLM work
 Comment[zh_CN]=关闭图形会话并切换到纯 TTY，把显存和内存让给 ComfyUI / LLM
 Exec=pkexec $DEST tty
@@ -1096,7 +1096,7 @@ EOF
 
   say ""
   say "from a console : sudo $PROG tty | desktop | status"
-  say "from desktop   : click 'Free VRAM (pure TTY)'"
+  say "from desktop   : click 'Switch to Pure TTY'"
   say "check setup    : $PROG doctor"
 }
 
